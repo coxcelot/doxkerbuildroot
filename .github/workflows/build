@@ -1,0 +1,105 @@
+# GitHub Actions workflow: build Docker-enabled Buildroot Linux for v86
+#
+# What this does:
+#   1. Clones buildroot 2024.02.5 (the version browser-buildroot pins)
+#   2. Copies in the browser-buildroot "standard" config + board files
+#   3. Applies the Docker fragment (BR2_PACKAGE_DOCKER_ENGINE + deps)
+#   4. Switches the rootfs to an initramfs embedded in the bzImage
+#      (v86 loads a single bzImage; it cannot mount a separate rootfs)
+#   5. Builds, then uploads bzImage + the raw rootfs as artifacts
+#
+# Requires: enable "workflow_dispatch" on the Actions tab. No secrets needed.
+
+name: build-docker-v86
+
+on:
+  workflow_dispatch:
+
+jobs:
+  buildroot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget cpio unzip rsync bc gawk bison flex \
+            file python3 perl patch texinfo makeinfo \
+            libncurses5-dev libncursesw5-dev libssl-dev libelf-dev \
+            gcc-multilib libc6-dev-i386 lib32ncurses6 lib32stdc++6 \
+            zlib1g-dev libidn2-dev libattr1-dev gperf gettext libtool autoconf \
+            automake autopoint pkg-config libtool-bin
+          # buildroot host tools need a few more:
+          sudo apt-get install -y --no-install-recommends \
+            liblz4-tool zstd libzstd-dev libacl1-dev libtirpc-dev
+
+      - name: Get buildroot 2024.02.5
+        run: |
+          curl -fsSL -o /tmp/br.tar.gz \
+            https://buildroot.org/downloads/buildroot-2024.02.5.tar.gz
+          tar -xzf /tmp/br.tar.gz -C .
+          echo "BR_ROOT=$GITHUB_WORKSPACE/buildroot-2024.02.5" >> "$GITHUB_ENV"
+
+      - name: Drop in browser-buildroot standard config
+        run: |
+          cd "$BR_ROOT"
+          cp "$GITHUB_WORKSPACE/standard/.config" .config
+          mkdir -p board/browser_linux/rootfs_overlay
+          cp -r "$GITHUB_WORKSPACE/standard/board/browser_linux/"* board/browser_linux/
+          chmod +x board/browser_linux/rootfs_overlay/usr/bin/* 2>/dev/null || true
+
+      - name: Apply Docker config fragment
+        run: |
+          cd "$BR_ROOT"
+          # Append the Docker options (they override nothing; base already satisfied them)
+          cat >> .config <<'EOF'
+          BR2_PACKAGE_CA_CERTIFICATES=y
+          BR2_PACKAGE_LIBSECCOMP=y
+          BR2_PACKAGE_RUNC=y
+          BR2_PACKAGE_CONTAINERD=y
+          BR2_PACKAGE_DOCKER_CLI=y
+          BR2_PACKAGE_DOCKER_ENGINE=y
+          BR2_PACKAGE_DOCKER_ENGINE_DOCKER_INIT_TINI=y
+          # v86: embed the initramfs into the kernel image (bzImage)
+          # (2024.02.5's docker-engine auto-selects the cgroupfs-mount pkg - keep it)
+          BR2_TARGET_ROOTFS_CPIO=y
+          BR2_TARGET_ROOTFS_CPIO_LZ4=y
+          BR2_TARGET_ROOTFS_INITRAMFS=y
+          EOF
+          # Re-run the kconfig to reconcile dependencies (keeps the Docker selects happy)
+          make olddefconfig
+
+      - name: Merge Docker kernel options
+        run: |
+          cd "$BR_ROOT"
+          cat "$GITHUB_WORKSPACE/standard/board/browser_linux/docker-kernel.config" \
+              >> board/browser_linux/linux.conf
+          make linux-reconfigure 2>&1 | tail -20 || true
+
+      - name: Build (toolchain + rootfs + kernel)
+        run: |
+          cd "$BR_ROOT"
+          # Buildroot refuses to run as root; GitHub Actions runs as runner user by default.
+          # Set a parallel build and a reasonable job count for the 7-core runner.
+          make -j4 2>&1 | tee /tmp/build.log
+          echo "BR_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      - name: Check build result
+        run: |
+          set -e
+          test -f "$BR_ROOT/output/images/bzImage"
+          ls -la "$BR_ROOT/output/images/"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-v86-images
+          path: |
+            buildroot-2024.02.5/output/images/bzImage
+            buildroot-2024.02.5/output/images/rootfs.cpio*
+            buildroot-2024.02.5/output/target/lib/systemd/system/docker.service
+            buildroot-2024.02.5/output/build/linux-*/vmlinux
+          if-no-files-found: warn
